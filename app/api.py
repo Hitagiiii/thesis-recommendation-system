@@ -424,10 +424,13 @@ def attach_pdf(
 ):
     """
     Confirm step: downloads the PDF at the given URL (a candidate the
-    user picked from /find-pdf), verifies it actually matches this
-    paper (by DOI-in-text if we have a DOI, otherwise by re-extracted
-    title similarity), and attaches it the same way an uploaded PDF
-    is stored.
+    user picked from /find-pdf), verifies it, and stores it the same
+    way an uploaded PDF is stored. Then runs the same metadata
+    extraction the normal PDF-upload path uses on the newly downloaded
+    file, backfilling whatever the paper is still missing
+    (title/abstract/keywords/publication_year). A field the paper
+    already has -- e.g. a title from its original BibTeX import -- is
+    never overwritten.
     """
 
     paper = (
@@ -469,8 +472,84 @@ def attach_pdf(
 
     paper.stored_path = stored_path
 
+    # --------------------------------------------------------
+    # Extract metadata from the file we just downloaded and use
+    # it to backfill whatever the paper is still missing -- the
+    # same fields a normal PDF upload extracts. A field already
+    # on the paper is left alone.
+    # --------------------------------------------------------
+
+    changed_recommendation_fields = False
+
+    try:
+        full_path = get_paper_file_path(stored_path)
+        extracted = extract_metadata_from_pdf(full_path)
+
+    except Exception as error:
+
+        print()
+        print("METADATA EXTRACTION FAILED FOR ATTACHED PDF")
+        print(error)
+
+        extracted = {}
+
+    backfill_fields = (
+        "title",
+        "abstract",
+        "keywords",
+        "publication_year",
+    )
+
+    for field in backfill_fields:
+        current_value = getattr(paper, field, None)
+
+        is_blank = (
+            current_value is None
+            or (
+                isinstance(current_value, str)
+                and not current_value.strip()
+            )
+        )
+
+        extracted_value = extracted.get(field)
+
+        if is_blank and extracted_value:
+            setattr(paper, field, extracted_value)
+            changed_recommendation_fields = True
+
+            if field == "keywords":
+                paper.keywords_source = extracted.get(
+                    "keywords_source"
+                )
+                paper.keywords_generated = extracted.get(
+                    "keywords_generated",
+                    False,
+                )
+
+    if not paper.subject_category:
+        try:
+            classify_paper(paper)
+        except Exception as error:
+            print("WARNING: classification failed after attach-pdf")
+            print(error)
+
+    try:
+        validate_paper(paper)
+        refresh_prepared_text(paper)
+    except Exception as error:
+        print("WARNING: validation/prepared-text refresh failed after attach-pdf")
+        print(error)
+
     db.commit()
     db.refresh(paper)
+
+    if changed_recommendation_fields:
+        set_recommendation_index_stale(True)
+
+        print(
+            f"Recommendation index is stale for paper {paper.id}. "
+            "Rebuild required."
+        )
 
     return paper
 

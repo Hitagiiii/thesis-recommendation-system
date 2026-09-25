@@ -202,11 +202,19 @@ export default function MyLibrary() {
       )}
 
       {/* PDF Viewer Modal */}
-      <PaperViewerModal
-        paper={selectedPaper}
-        open={isViewerOpen}
-        onClose={handleClosePaper}
-      />
+<PaperViewerModal
+  paper={selectedPaper}
+  open={isViewerOpen}
+  onClose={handleClosePaper}
+  onPaperUpdated={(updated) => {
+    setEntries((prev) =>
+      prev.map((entry) =>
+        entry.paper.id === updated.id ? { ...entry, paper: updated } : entry
+      )
+    );
+    setSelectedPaper(updated);
+  }}
+/>
     </PageShell>
   );
 }

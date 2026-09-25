@@ -1140,13 +1140,27 @@ def download_and_attach_pdf(
             url,
             timeout=REQUEST_TIMEOUT,
             stream=True,
-            headers={"User-Agent": "PaperRec/1.0 (academic PDF fetch)"},
+            headers={
+                # Some publishers (MDPI included) block generic/bot-looking
+                # User-Agent strings with a 403. A browser-shaped UA plus an
+                # Accept header gets treated as a normal reader request.
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/pdf,*/*",
+            },
         )
     except requests.RequestException as exc:
         raise ValueError(f"Could not reach that link: {exc}") from exc
 
     if not response.ok:
-        raise ValueError(f"That link returned HTTP {response.status_code}.")
+        raise ValueError(
+            f"That link returned HTTP {response.status_code}. "
+            "The source may be blocking automated downloads -- "
+            "try a different candidate or upload the PDF manually."
+        )
 
     content_type = response.headers.get("Content-Type", "").lower()
 

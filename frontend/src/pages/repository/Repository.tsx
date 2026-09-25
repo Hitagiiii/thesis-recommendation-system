@@ -215,7 +215,16 @@ export default function Repository() {
         </section>
       )}
 
-      <PaperViewerModal paper={selectedPaper} open={!!selectedPaper} onClose={() => setSelectedPaper(null)} canEdit />
+    <PaperViewerModal
+      paper={selectedPaper}
+      open={!!selectedPaper}
+      onClose={() => setSelectedPaper(null)}
+      canEdit
+      onPaperUpdated={(updated) => {
+        setPapers((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+        setSelectedPaper(updated);
+    }}
+/>
     </PageShell>
   );
 }
