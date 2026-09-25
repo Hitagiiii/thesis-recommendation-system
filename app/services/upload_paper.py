@@ -10,6 +10,11 @@ from app.services.extraction import extract_metadata_from_pdf
 from app.services.text_preparation import refresh_prepared_text
 from app.services.validation import validate_paper
 from app.services.storage import save_paper_file
+from app.services.pdf_finder import find_pdf_candidates
+from app.services.metadata_enrichment import (
+    enrich_paper_metadata,
+    is_title_corrupted,
+)
 
 
 def _refresh_recommendation_fields(paper: Paper) -> None:
@@ -22,6 +27,79 @@ def _refresh_recommendation_fields(paper: Paper) -> None:
         )
 
 
+def _needs_enrichment(paper: Paper) -> bool:
+    """
+    True when at least one of the four recommendation-required fields
+    is missing/unusable, or the title looks corrupted -- i.e. there's
+    actually something for enrichment to fix. Used to skip the network
+    round-trip entirely for papers that already extracted cleanly.
+    """
+    if is_title_corrupted(paper.title):
+        return True
+
+    if not paper.abstract or len(paper.abstract.strip()) < 40:
+        return True
+
+    if paper.publication_year is None:
+        return True
+
+    if not paper.author:
+        return True
+
+    return False
+
+
+def _try_enrich_from_pdf_discovery(paper: Paper) -> None:
+    """
+    Best-effort automatic metadata enrichment (the "more thorough"
+    option): runs the same PDF-discovery lookup used by the "Find PDF
+    Online" button (Unpaywall, Crossref, Semantic Scholar, arXiv,
+    OpenAlex) on every upload, right after validation, instead of only
+    when a user manually clicks Find PDF. Every source in pdf_finder.py
+    already downloads a candidate's title/abstract/year/authors to
+    compute a match score -- this lets that data fill in whatever this
+    paper is actually missing, rather than being thrown away.
+
+    Deliberately conservative about when it runs and what it touches:
+
+        - Skipped entirely if the paper already looks complete
+          (_needs_enrichment), so a clean upload costs nothing extra.
+        - Skipped if there's no title to search with -- every source
+          here is title-keyed (or DOI-keyed, and a DOI search only
+          starts from a Crossref *title* lookup in the first place).
+        - Never raises. Enrichment is optional and best-effort; a
+          network hiccup or a rate-limited source here must never
+          fail the upload itself. Any error is logged and swallowed,
+          same pattern as the classification/validation steps above.
+
+    validate_paper() and refresh_prepared_text() are re-run afterward
+    only if enrich_paper_metadata() actually changed something, since
+    abstract/year changes can flip is_valid_for_recommendation and
+    title/abstract/keyword changes affect prepared_text.
+    """
+    if not _needs_enrichment(paper):
+        return
+
+    if not paper.title:
+        return
+
+    try:
+        candidates = find_pdf_candidates(paper)
+        changed_fields = enrich_paper_metadata(paper, candidates)
+
+        if changed_fields:
+            print(
+                f"INFO: Metadata enrichment filled {changed_fields} "
+                f"for {paper.source_filename!r}"
+            )
+
+            validate_paper(paper)
+            refresh_prepared_text(paper)
+
+    except Exception as exc:
+        print(f"WARNING: Metadata enrichment failed: {exc}")
+
+
 def upload_paper(
     db: Session,
     source_path: str,
@@ -31,11 +109,20 @@ def upload_paper(
     Import a PDF or BibTeX file into the repository.
 
     PDF:
-        Uses the existing PDF extraction pipeline.
+        Uses the existing PDF extraction pipeline. extraction.py now
+        also reads a DOI directly off the PDF's own text (Zotero's
+        recognizePDF approach: read what's on the document before
+        searching external databases), so this paper often already
+        has a DOI on file before enrichment/PDF-discovery ever runs.
 
     BibTeX:
         Uses the BibTeX parser, followed by best-effort
         Google Scholar enrichment for missing metadata.
+
+    Both:
+        Followed by automatic metadata enrichment (Step 5b) that fills
+        in whatever Title/Abstract/Publication Year/Author extraction
+        couldn't recover, using PDF-discovery search results.
     """
 
     source = Path(source_path)
@@ -83,7 +170,9 @@ def upload_paper(
         author=metadata.get("author"),
         abstract=metadata.get("abstract"),
         keywords=metadata.get("keywords"),
-        keywords_source=metadata.get("keywords_source"),
+        keywords_source=metadata.get(
+            "keywords_source"
+        ),
         keywords_generated=metadata.get(
             "keywords_generated",
             False,
@@ -124,6 +213,16 @@ def upload_paper(
         print(
             f"WARNING: Paper validation failed: {exc}"
         )
+
+    # ---------------------------------------------------------
+    # STEP 5b — Automatic metadata enrichment ("thorough" path)
+    #
+    # Runs before the first commit so an enriched paper is written
+    # to the database once, already enriched, rather than inserted
+    # incomplete and patched in a second write.
+    # ---------------------------------------------------------
+
+    _try_enrich_from_pdf_discovery(paper)
 
     # ---------------------------------------------------------
     # STEP 6 — Prepare recommendation text

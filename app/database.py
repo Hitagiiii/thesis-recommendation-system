@@ -1,10 +1,10 @@
-"""
-Database engine and session setup.
+#"""
+#Database engine and session setup.
 
-Uses SQLite as specified in the Data Layer (Chapter 3, 3.5.4).
-create_all() is used instead of Alembic migrations since the schema is
-fixed for the scope of this thesis prototype.
-"""
+#Uses SQLite as specified in the Data Layer (Chapter 3, 3.5.4).
+#create_all() is used instead of Alembic migrations since the schema is
+#fixed for the scope of this thesis prototype.
+
 
 import os
 

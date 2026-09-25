@@ -21,6 +21,7 @@ class PaperOut(BaseModel):
     citation_count: int | None = None
     is_valid_for_recommendation: bool
     missing_fields: str | None = None
+    enrichment_notes: str | None = None   
     source_filename: str | None = None
     extraction_method: str | None = None
     stored_path: str | None = None

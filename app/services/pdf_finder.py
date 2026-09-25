@@ -9,7 +9,11 @@ candidates are returned so the user can pick):
        BibTeX exports, which almost never include one), Crossref is
        used to resolve one from the title/author, so Unpaywall --
        the strongest source -- isn't skipped just because the .bib
-       file didn't have a doi field.
+       file didn't have a doi field. (PDF uploads increasingly skip
+       this step entirely: app/services/extraction.py now reads a DOI
+       straight off the PDF's own text first, Zotero-recognizePDF
+       style, so there's often already a DOI on file by the time this
+       runs.)
     1. Unpaywall, by DOI (if the paper has one, or one was just
        resolved via Crossref) -- the most reliable source for a
        legally open-access PDF.
@@ -44,6 +48,16 @@ higher of the two. A pure character-sequence ratio is brutally
 sensitive to word reordering and subtitle differences ("X: a study of
 Y" vs "X -- a study of Y"), which was silently killing otherwise-good
 matches.
+
+Metadata enrichment (see app/services/metadata_enrichment.py):
+    Every search function below already downloads a candidate's title,
+    abstract, publication year, and author list from the external
+    source -- it used to use that data only to compute the confidence
+    score above, then discard everything except the DOI. PdfCandidate
+    now carries abstract/publication_year/authors alongside the fields
+    the API response uses, so metadata_enrichment.py can fill a
+    paper's own missing/corrupted fields from whichever candidate
+    matched best, instead of that data being thrown away.
 
 Once the user confirms a candidate, download_and_attach_pdf() downloads
 it and -- before saving it -- runs two checks directly against the
@@ -144,6 +158,22 @@ class PdfCandidate:
     confidence: float      # 0.0-1.0, title + year + author based
     landing_page_url: str | None = None
     license: str | None = None
+
+    # -------------------------------------------------------------
+    # Enrichment-only fields.
+    #
+    # Not part of PdfCandidateOut (app/schemas.py) -- FastAPI/Pydantic
+    # silently drops unrecognized keys, so these ride along on every
+    # candidate returned by find_pdf_candidates() without changing the
+    # /find-pdf API response shape. metadata_enrichment.py reads them
+    # to fill in a paper's own missing/corrupted title, abstract,
+    # publication year, or author -- data every source below already
+    # fetches to compute `confidence`, which previously got thrown
+    # away right after scoring.
+    # -------------------------------------------------------------
+    abstract: str | None = None
+    publication_year: int | None = None
+    authors: list[str] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -363,9 +393,53 @@ def _apply_author_adjustment(
 
 
 # ---------------------------------------------------------------------
+# OpenAlex abstract reconstruction
+# ---------------------------------------------------------------------
+
+def _reconstruct_openalex_abstract(
+    inverted_index: dict[str, list[int]] | None,
+) -> str | None:
+    """
+    OpenAlex returns an abstract as `abstract_inverted_index` -- a
+    word -> [positions] map instead of running text (a copyright-
+    avoidance format) -- e.g.:
+
+        {"Neural": [0], "networks": [1], "are": [2], ...}
+
+    This rebuilds a plain-text abstract by placing each word back at
+    its recorded position(s). Good enough for keyword search / display
+    purposes; not guaranteed to reproduce the original's exact
+    formatting or punctuation spacing.
+    """
+    if not inverted_index:
+        return None
+
+    try:
+        max_position = max(
+            position
+            for positions in inverted_index.values()
+            for position in positions
+        )
+    except ValueError:
+        return None
+
+    words: list[str] = [""] * (max_position + 1)
+
+    for word, positions in inverted_index.items():
+        for position in positions:
+            if 0 <= position <= max_position:
+                words[position] = word
+
+    abstract = " ".join(word for word in words if word)
+    abstract = " ".join(abstract.split())
+
+    return abstract or None
+
+
+# ---------------------------------------------------------------------
 # DOI resolution via Crossref (for papers with no DOI on file --
-# this is the common case for Google Scholar BibTeX exports, which
-# almost never include a doi field)
+# common for Google Scholar BibTeX exports, and for any PDF upload
+# where extraction.py's own DOI-in-text scan came up empty)
 # ---------------------------------------------------------------------
 
 def _crossref_search(paper: Paper, rows: int = 5) -> list[dict]:
@@ -492,6 +566,8 @@ def _search_crossref_pdf_links(paper: Paper) -> list[PdfCandidate]:
                 title=candidate_title or None,
                 confidence=confidence,
                 landing_page_url=item.get("URL"),
+                publication_year=candidate_year,
+                authors=candidate_authors or None,
             )
         )
 
@@ -567,6 +643,9 @@ def _search_unpaywall(paper: Paper) -> list[PdfCandidate]:
                 confidence=confidence,
                 landing_page_url=loc.get("url_for_landing_page"),
                 license=loc.get("license"),
+                publication_year=result_year,
+                authors=result_authors or None,
+                # Unpaywall's API doesn't return an abstract.
             )
         )
 
@@ -588,7 +667,10 @@ def _search_semantic_scholar(paper: Paper) -> list[PdfCandidate]:
         params={
             "query": paper.title,
             "limit": 5,
-            "fields": "title,year,authors,openAccessPdf,externalIds",
+            # "abstract" added so metadata_enrichment.py can offer it
+            # as a fill-in when a paper's own abstract extraction
+            # failed or came back too short to pass validate_paper().
+            "fields": "title,year,authors,abstract,openAccessPdf,externalIds",
         },
         headers=headers,
         source="semantic_scholar",
@@ -648,6 +730,9 @@ def _search_semantic_scholar(paper: Paper) -> list[PdfCandidate]:
                 title=result_title,
                 confidence=confidence,
                 license=pdf_info.get("license"),
+                abstract=result.get("abstract"),
+                publication_year=result_year,
+                authors=result_authors or None,
             )
         )
 
@@ -705,6 +790,7 @@ def _search_arxiv(paper: Paper) -> list[PdfCandidate]:
         title_match = re.search(r"<title>(.*?)</title>", entry, re.DOTALL)
         id_match = re.search(r"<id>(.*?)</id>", entry, re.DOTALL)
         published_match = re.search(r"<published>(\d{4})", entry)
+        summary_match = re.search(r"<summary>(.*?)</summary>", entry, re.DOTALL)
         author_matches = re.findall(
             r"<author>\s*<name>(.*?)</name>", entry, re.DOTALL
         )
@@ -718,6 +804,12 @@ def _search_arxiv(paper: Paper) -> list[PdfCandidate]:
 
         entry_year = (
             int(published_match.group(1)) if published_match else None
+        )
+
+        entry_abstract = (
+            " ".join(summary_match.group(1).split())
+            if summary_match
+            else None
         )
 
         entry_authors = [name.strip() for name in author_matches if name.strip()]
@@ -744,6 +836,9 @@ def _search_arxiv(paper: Paper) -> list[PdfCandidate]:
                 title=entry_title,
                 confidence=confidence,
                 landing_page_url=abs_url,
+                abstract=entry_abstract,
+                publication_year=entry_year,
+                authors=entry_authors or None,
             )
         )
 
@@ -801,6 +896,13 @@ def _search_openalex(paper: Paper) -> list[PdfCandidate]:
             if (authorship.get("author") or {}).get("display_name")
         ]
 
+        # OpenAlex returns the abstract as a word -> position map
+        # rather than running text (a copyright-avoidance format);
+        # rebuild it into plain text for enrichment purposes.
+        result_abstract = _reconstruct_openalex_abstract(
+            result.get("abstract_inverted_index")
+        )
+
         base_confidence = _title_similarity(paper.title, result_title)
         confidence = _apply_year_adjustment(
             base_confidence, paper.publication_year, result_year
@@ -817,6 +919,9 @@ def _search_openalex(paper: Paper) -> list[PdfCandidate]:
                 confidence=confidence,
                 landing_page_url=oa_location.get("landing_page_url"),
                 license=oa_location.get("license"),
+                abstract=result_abstract,
+                publication_year=result_year,
+                authors=result_authors or None,
             )
         )
 
@@ -891,6 +996,12 @@ def _search_google_scholar_via_serpapi(paper: Paper) -> list[PdfCandidate]:
                 title=result_title or None,
                 confidence=confidence,
                 landing_page_url=result.get("link"),
+                # SerpApi's organic_results snippet is the closest
+                # thing to an abstract Scholar exposes -- close enough
+                # in spirit but often truncated with an ellipsis, so
+                # it's deliberately left out of enrichment rather than
+                # risking a half-sentence abstract.
+                authors=result_authors or None,
             )
         )
 

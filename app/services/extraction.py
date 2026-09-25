@@ -19,6 +19,18 @@ The keyword extraction uses two redundancy-control layers:
    - Phrase containment
    - Highly overlapping keyword phrases
 
+DOI extraction (new):
+    Scans the extracted PDF text directly for a DOI, the same "read
+    what's already on the document before searching external
+    databases" approach Zotero's PDF metadata recognizer uses
+    (recognizePDF.js looks for a DOI/ISBN in the extracted text and
+    only falls back to a bibliographic search if none is found). A
+    DOI found this way is far more reliable than the fuzzy
+    title-similarity search app/services/pdf_finder.py otherwise has
+    to fall back on (_resolve_doi_via_crossref), and it costs nothing
+    -- no network call, just a regex over text already extracted for
+    title/abstract/keywords.
+
 Requires:
     pip install pdfplumber yake
 """
@@ -70,6 +82,18 @@ KEYWORDS_LINE = re.compile(
 
 DOT_LEADER_PATTERN = re.compile(
     r"(?:\.[ \t]?){4,}\d+"
+)
+
+# Matches the DOI syntax registered with the International DOI
+# Foundation: a "10." prefix, a 4+ digit registrant code, a slash,
+# then a publisher-defined suffix. The suffix character class is
+# intentionally broad (DOIs can legally contain many punctuation
+# characters) but excludes whitespace and angle/quote characters that
+# would mean the match has run into surrounding prose rather than the
+# DOI itself.
+DOI_PATTERN = re.compile(
+    r"\b10\.\d{4,9}/[^\s\"'<>]+",
+    re.IGNORECASE,
 )
 
 
@@ -299,6 +323,56 @@ def _extract_abstract(
             return abstract
 
     return None
+
+
+# ---------------------------------------------------------------------
+# DOI extraction (Zotero-style: read it off the document first)
+# ---------------------------------------------------------------------
+
+def _extract_doi(
+    full_text: str,
+) -> str | None:
+    """
+    Scans the extracted PDF text for a DOI.
+
+    Academic PDFs very commonly print their own DOI on the title page
+    or in a running header/footer, e.g.:
+
+        doi: 10.1000/xyz123
+        DOI:10.1000/xyz123
+        https://doi.org/10.1000/xyz123
+
+    Reading it directly here means:
+
+        - upload_paper.py's Paper record gets a DOI at insertion time
+          instead of staying doi=None until someone runs "Find PDF
+          Online".
+        - app/services/pdf_finder.py's find_pdf_candidates() then goes
+          straight to Unpaywall (its strongest, DOI-keyed source) with
+          high confidence, instead of first needing a fuzzy
+          Crossref-by-title lookup (_resolve_doi_via_crossref) that
+          can pick the wrong paper when titles are similar.
+
+    Returns None if nothing plausible is found -- callers should treat
+    that as "no DOI available yet", not as an error; pdf_finder.py's
+    existing Crossref fallback still covers this case, and BibTeX
+    imports (which have no PDF text at all) are unaffected.
+    """
+    match = DOI_PATTERN.search(full_text)
+
+    if not match:
+        return None
+
+    doi = match.group(0)
+
+    # Trim trailing characters that are almost always sentence/line
+    # punctuation picked up by the greedy suffix match rather than
+    # part of the DOI itself (a DOI can legally contain some of these
+    # mid-string, but PDF-extracted text essentially never ends a DOI
+    # on one of them).
+    doi = doi.rstrip(").,;:]}\u2019\u201d")
+
+    return doi or None
 
 
 # ---------------------------------------------------------------------
@@ -761,6 +835,7 @@ def extract_metadata_from_pdf(
             "keywords_source": "author" | "yake" | None,
             "keywords_generated": bool,
             "publication_year": int | None,
+            "doi": str | None,
         }
     """
     pages_text = _extract_full_text(
@@ -806,6 +881,9 @@ def extract_metadata_from_pdf(
             "keywords_generated"
         ],
         "publication_year": _extract_publication_year(
+            full_text
+        ),
+        "doi": _extract_doi(
             full_text
         ),
     }

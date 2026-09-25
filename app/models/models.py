@@ -171,11 +171,19 @@ class Paper(Base):
         nullable=False,
         index=True,
     )
-
+# Human-readable trace of what metadata_enrichment.py filled in and
+    # from which source, e.g. "abstract <- semantic_scholar (confidence 0.76)".
+    # Optional -- see scripts/migrate_add_enrichment_notes.py.
     missing_fields = Column(
         Text,
         nullable=True,
     )
+    enrichment_notes = Column(
+    Text,
+    nullable=True,
+)
+   
+    
     # Example:
     # "abstract, publication_year"
 

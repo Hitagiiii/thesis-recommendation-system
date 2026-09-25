@@ -337,9 +337,11 @@ def find_pdf(
 ):
     """
     Search-only step: looks for a legal open-access PDF matching this
-    paper (Unpaywall, Crossref, Semantic Scholar, arXiv, OpenAlex) and
-    returns candidates for the user to review. Nothing is downloaded
-    here.
+    paper (Unpaywall, Crossref, Semantic Scholar, arXiv, OpenAlex)
+    and returns candidates for the user to review.
+
+    Metadata enrichment is also attempted using the same candidates.
+    Nothing is downloaded here.
     """
 
     paper = (
@@ -360,11 +362,14 @@ def find_pdf(
             detail="This paper already has a stored PDF.",
         )
 
+    # --------------------------------------------------------
+    # Find PDF candidates
+    # --------------------------------------------------------
+
     try:
         candidates = find_pdf_candidates(paper)
 
     except Exception as error:
-
         print()
         print("FIND PDF FAILED")
         print(error)
@@ -372,21 +377,41 @@ def find_pdf(
         raise HTTPException(
             status_code=502,
             detail="Could not search for a PDF right now.",
+        ) from error
+
+    # --------------------------------------------------------
+    # Best-effort metadata enrichment
+    # --------------------------------------------------------
+
+    try:
+        from app.services.metadata_enrichment import enrich_paper_metadata
+
+        changed = enrich_paper_metadata(
+            paper,
+            candidates,
         )
 
-    # find_pdf_candidates() may resolve and set paper.doi via Crossref
-    # when the paper had none on file. Persist it so future searches
-    # (and attach_pdf's verification step) don't re-resolve it every
-    # time -- a GET request's session otherwise discards the change
-    # when it closes.
+        if changed:
+            validate_paper(paper)
+            refresh_prepared_text(paper)
+            set_recommendation_index_stale(True)
+
+    except Exception as error:
+        print("WARNING: Metadata enrichment failed:")
+        print(error)
+
+    # --------------------------------------------------------
+    # Persist changes made by find_pdf_candidates() or enrichment
+    # --------------------------------------------------------
+
     if db.is_modified(paper):
         db.commit()
+        db.refresh(paper)
 
     return [
         PdfCandidateOut(**candidate.to_dict())
         for candidate in candidates
     ]
-
 
 @app.post(
     "/api/papers/{paper_id}/attach-pdf",
